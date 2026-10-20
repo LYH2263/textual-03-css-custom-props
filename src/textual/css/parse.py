@@ -43,6 +43,44 @@ SELECTOR_MAP: dict[str, tuple[SelectorType, Specificity3]] = {
 RE_ID_SELECTOR = re.compile("#" + IDENTIFIER)
 
 
+@lru_cache(maxsize=256)
+def _line_offsets(code: str) -> tuple[int, ...]:
+    """Get the character offset of the start of each line in ``code``."""
+    offsets = [0]
+    for index, char in enumerate(code):
+        if char == "\n":
+            offsets.append(index + 1)
+    return tuple(offsets)
+
+
+def _token_offset(token: Token) -> int:
+    """Get the absolute character offset of a token within its source."""
+    line, column = token.location
+    return _line_offsets(token.code)[line] + column
+
+
+def _declaration_raw(declaration: Declaration, boundary: Token) -> str | None:
+    """Recover the original (pre variable substitution) source of a declaration.
+
+    Args:
+        declaration: The declaration which has just been completed.
+        boundary: The token which terminated the declaration (the next
+            declaration name, or the ``}`` closing the block).
+
+    Returns:
+        The raw source between the end of the declaration name and the start
+        of the boundary token, or ``None`` if it can't be recovered.
+    """
+    name_token = declaration.token
+    if name_token.code is not boundary.code:
+        return None
+    start = _token_offset(name_token) + len(name_token.value)
+    end = _token_offset(boundary)
+    if end < start:
+        return None
+    return name_token.code[start:end]
+
+
 @lru_cache(maxsize=128)
 def is_id_selector(selector: str) -> bool:
     """Is the selector a single ID selector, i.e. "#foo"?
@@ -189,6 +227,7 @@ def parse_rule_set(
     declaration = Declaration(token, "")
     errors: list[tuple[Token, str | HelpText]] = []
     nested_rules: list[RuleSet] = []
+    block_end_token: Token | None = None
 
     while True:
         token = next(tokens)
@@ -260,6 +299,7 @@ def parse_rule_set(
                     nested_rules.append(nested_rule_set)
             continue
         if token_name == "declaration_name":
+            declaration.raw = _declaration_raw(declaration, token)
             try:
                 styles_builder.add_declaration(declaration)
             except DeclarationError as error:
@@ -267,10 +307,13 @@ def parse_rule_set(
             declaration = Declaration(token, "")
             declaration.name = token.value.rstrip(":")
         elif token_name == "declaration_set_end":
+            block_end_token = token
             break
         else:
             declaration.tokens.append(token)
 
+    if block_end_token is not None:
+        declaration.raw = _declaration_raw(declaration, block_end_token)
     try:
         styles_builder.add_declaration(declaration)
     except DeclarationError as error:
@@ -366,7 +409,10 @@ def _unresolved(variable_name: str, variables: Iterable[str], token: Token) -> N
 
 
 def substitute_references(
-    tokens: Iterable[Token], css_variables: dict[str, list[Token]] | None = None
+    tokens: Iterable[Token],
+    css_variables: dict[str, list[Token]] | None = None,
+    *,
+    allow_unresolved: bool = False,
 ) -> Iterable[Token]:
     """Replace variable references with values by substituting variable reference
     tokens with the tokens representing their values.
@@ -374,13 +420,19 @@ def substitute_references(
     Args:
         tokens: Iterator of Tokens which may contain tokens
             with the name "variable_ref".
+        allow_unresolved: When ``True``, variable references which can't be
+            resolved against ``css_variables`` are yielded unchanged, rather
+            than raising an [`UnresolvedVariableError`][textual.css.errors.UnresolvedVariableError].
+            This is used to defer resolution of subtree scoped custom properties
+            until the stylesheet is applied to a node.
 
     Returns:
         Yields Tokens such that any variable references (tokens where
             token.name == "variable_ref") have been replaced with the tokens representing
             the value. In other words, an Iterable of Tokens similar to the original input,
             but with variables resolved. Substituted tokens will have their referenced_by
-            attribute populated with information about where the tokens are being substituted to.
+            attribute populated with information about where the tokens are being substituted
+            to.
     """
     variables: dict[str, list[Token]] = css_variables.copy() if css_variables else {}
     iter_tokens = iter(tokens)
@@ -426,6 +478,9 @@ def substitute_references(
                                     ref_name, ref_location, ref_length, token.code
                                 )
                             )
+                    elif allow_unresolved:
+                        variable_tokens.append(token)
+                        yield token
                     else:
                         _unresolved(ref_name, variables.keys(), token)
                 else:
@@ -443,6 +498,8 @@ def substitute_references(
                     yield _token.with_reference(
                         ReferencedBy(variable_name, ref_location, ref_length, ref_code)
                     )
+            elif allow_unresolved:
+                yield token
             else:
                 _unresolved(variable_name, variables.keys(), token)
         else:
@@ -457,6 +514,7 @@ def parse(
     variable_tokens: dict[str, list[Token]] | None = None,
     is_default_rules: bool = False,
     tie_breaker: int = 0,
+    allow_unresolved: bool = False,
 ) -> Iterable[RuleSet]:
     """Parse CSS by tokenizing it, performing variable substitution,
     and generating rule sets from it.
@@ -468,12 +526,21 @@ def parse(
         variables: Substitution variables to substitute tokens for.
         is_default_rules: True if the rules we're extracting are
             default (i.e. in Widget.DEFAULT_CSS) rules. False if they're from user defined CSS.
+        allow_unresolved: When ``True``, references to variables absent from
+            ``variables`` / ``variable_tokens`` are left in place, to be resolved
+            later against a node's subtree scoped custom properties.
     """
     reference_tokens = tokenize_values(variables) if variables is not None else {}
     if variable_tokens:
         reference_tokens.update(variable_tokens)
 
-    tokens = iter(substitute_references(tokenize(css, read_from), variable_tokens))
+    tokens = iter(
+        substitute_references(
+            tokenize(css, read_from),
+            variable_tokens,
+            allow_unresolved=allow_unresolved,
+        )
+    )
     while True:
         token = next(tokens, None)
         if token is None:

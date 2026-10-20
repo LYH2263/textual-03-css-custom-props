@@ -174,6 +174,14 @@ class Declaration:
     token: Token
     name: str
     tokens: list[Token] = field(default_factory=list)
+    raw: str | None = None
+    """The raw source between the ':' and the next declaration / end of block.
+
+    Retained for declarations which reference ``$variables``, so that the
+    value may be re-resolved later against a per-node cascade of subtree
+    scoped CSS custom properties. ``None`` for declarations that don't need
+    deferred resolution.
+    """
 
 
 @rich.repr.auto(angular=True)

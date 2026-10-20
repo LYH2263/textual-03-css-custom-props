@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, NoReturn, cast
+from typing import ClassVar, Iterable, NoReturn, cast
 
 import rich.repr
 
@@ -70,7 +70,7 @@ from textual.css.scalar import (
     Unit,
     percentage_string_to_float,
 )
-from textual.css.styles import Styles
+from textual.css.styles import DeferredDeclaration, Styles
 from textual.css.tokenize import Token
 from textual.css.transition import Transition
 from textual.css.types import (
@@ -93,6 +93,28 @@ class StylesBuilder:
     to the appropriate internal types.
     """
 
+    # Declarations which write multiple rule names, mapping the declaration
+    # name (underscore form) to the rule names produced.
+    _COMPOSITE_RULE_NAMES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "border": ("border_top", "border_right", "border_bottom", "border_left"),
+        "outline": (
+            "outline_top",
+            "outline_right",
+            "outline_bottom",
+            "outline_left",
+        ),
+        "overflow": ("overflow_x", "overflow_y"),
+        "align": ("align_horizontal", "align_vertical"),
+        "content_align": ("content_align_horizontal", "content_align_vertical"),
+        "constrain": ("constrain_x", "constrain_y"),
+        "grid_gutter": ("grid_gutter_horizontal", "grid_gutter_vertical"),
+        "grid_size": ("grid_size_rows", "grid_size_columns"),
+        "scrollbar_size": (
+            "scrollbar_size_horizontal",
+            "scrollbar_size_vertical",
+        ),
+    }
+
     def __init__(self) -> None:
         self.styles = Styles()
 
@@ -104,6 +126,45 @@ class StylesBuilder:
 
     def error(self, name: str, token: Token, message: str | HelpText) -> NoReturn:
         raise DeclarationError(name, token, message)
+
+    def _predicted_rule_names(self, rule_name: str) -> tuple[str, ...]:
+        """Predict the concrete rule names a declaration will write.
+
+        This mirrors the writes performed by the ``process_*`` methods, and is
+        used when the declaration can't be converted at parse time because it
+        references a variable that will only exist in a node's subtree custom
+        property cascade.
+
+        Args:
+            rule_name: The declaration name in its underscore (Python) form.
+
+        Returns:
+            The rule names the declaration produces.
+        """
+        process_method = getattr(self, f"process_{rule_name}")
+        method = getattr(process_method, "__func__", process_method)
+        if method is StylesBuilder.process_color:
+            return (f"auto_{rule_name}", rule_name)
+        return self._COMPOSITE_RULE_NAMES.get(rule_name, (rule_name,))
+
+    def _register_deferred(
+        self, declaration: Declaration, rule_names: Iterable[str]
+    ) -> None:
+        """Record a declaration's raw source for later, per-node resolution.
+
+        Args:
+            declaration: The parsed declaration.
+            rule_names: The concrete rule names produced by the declaration.
+        """
+        raw = declaration.raw
+        if not raw or "$" not in raw:
+            return
+        deferred = DeferredDeclaration(
+            declaration.name, raw, declaration.token.read_from
+        )
+        deferred_rules = self.styles.deferred
+        for produced_rule_name in rule_names:
+            deferred_rules[produced_rule_name] = deferred
 
     def add_declaration(self, declaration: Declaration) -> None:
         if not declaration.name:
@@ -145,13 +206,50 @@ class StylesBuilder:
             value = tokens[0].value
             if value == "initial":
                 self.styles._rules[rule_name] = None
+                # An `initial` declaration supersedes an earlier unresolved
+                # declaration of the same property.
+                for produced_name in self._predicted_rule_names(rule_name):
+                    self.styles.unresolved.discard(produced_name)
                 return
+
+        # A value which still contains a `variable_ref` token references a
+        # variable that wasn't defined at parse time. Defer conversion until
+        # the stylesheet is applied to a node, where it may be supplied by the
+        # node's subtree scoped custom properties.
+        has_variable_reference = bool(declaration.raw and "$" in declaration.raw)
+        if has_variable_reference and any(
+            token.name == "variable_ref" for token in tokens
+        ):
+            predicted_rule_names = self._predicted_rule_names(rule_name)
+            if important and rule_name in self._COMPOSITE_RULE_NAMES:
+                # Mirror the !important distribution done by the composite
+                # process methods.
+                self.styles.important.discard(rule_name)
+                self.styles.important.update(predicted_rule_names)
+            self._register_deferred(declaration, predicted_rule_names)
+            self.styles.unresolved.update(predicted_rule_names)
+            return
+
         try:
             process_method(declaration.name, tokens)
         except DeclarationError:
             raise
         except Exception as error:
             self.error(declaration.name, declaration.token, str(error))
+
+        # A concrete declaration supersedes any earlier unresolved declaration
+        # for the rule names it actually writes.
+        for produced_name in self._predicted_rule_names(rule_name):
+            if produced_name in self.styles._rules:
+                self.styles.unresolved.discard(produced_name)
+
+        if has_variable_reference:
+            # The declaration references a variable known at parse time, but
+            # may be overridden by a subtree custom property when applied to a
+            # node. Keep the raw source so it can be re-resolved per node.
+            self._register_deferred(
+                declaration, self._predicted_rule_names(rule_name)
+            )
 
     def _process_enum_multiple(
         self, name: str, tokens: list[Token], valid_values: set[str], count: int

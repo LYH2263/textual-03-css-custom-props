@@ -4,7 +4,16 @@ import weakref
 from dataclasses import dataclass, field
 from functools import partial
 from operator import attrgetter
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Literal, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    NamedTuple,
+    cast,
+)
 
 import rich.repr
 from rich.style import Style
@@ -218,6 +227,32 @@ class RulesMap(TypedDict, total=False):
 RULE_NAMES = list(RulesMap.__annotations__.keys())
 RULE_NAMES_SET = frozenset(RULE_NAMES)
 _rule_getter = attrgetter(*RULE_NAMES)
+
+
+class DeferredDeclaration(NamedTuple):
+    """A declaration whose value references one or more ``$variables``.
+
+    The raw value is retained so that the declaration can be re-evaluated when
+    the stylesheet is applied to a node, against the merge of global / theme
+    variables and the subtree scoped custom properties in effect on that
+    node's ancestor chain.
+
+    Attributes:
+        css_name: The declaration name as written in CSS (hyphens preserved).
+        raw_value: The raw declaration source between the ``:`` and the next
+            declaration / end of the rule block.
+        read_from: The location the CSS was read from (used in errors).
+    """
+
+    css_name: str
+    raw_value: str
+    read_from: "CSSLocation"
+
+
+# Sentinel used in place of a rule value for declarations which reference
+# variables that could not (yet) be resolved at parse time. They are resolved
+# per node in Stylesheet.apply using the node's custom property cascade.
+_UNRESOLVED_RULE: Any = object()
 
 
 class StylesBase:
@@ -890,6 +925,18 @@ class Styles(StylesBase):
 
     important: set[str] = field(default_factory=set)
 
+    deferred: dict[str, DeferredDeclaration] = field(default_factory=dict)
+    """Maps rule names produced by declarations containing ``$variable``
+    references to the raw declaration, so values can be re-resolved against a
+    node's custom property cascade when the stylesheet is applied."""
+
+    unresolved: set[str] = field(default_factory=set)
+    """Rule names whose declaration couldn't be resolved at parse time.
+
+    Only these names are emitted with the unresolved sentinel; names in
+    ``deferred`` which did receive a concrete value at parse time don't
+    produce sentinel entries."""
+
     def __post_init__(self) -> None:
         self.get_rule: Callable[[str, object], object] = self._rules.get  # type: ignore[assignment]
         self.has_rule: Callable[[str], bool] = self._rules.__contains__  # type: ignore[assignment]
@@ -900,6 +947,8 @@ class Styles(StylesBase):
             node=self.node,
             _rules=self.get_rules(),
             important=self.important,
+            deferred=self.deferred.copy(),
+            unresolved=self.unresolved.copy(),
         )
 
     def clear_rule(self, rule_name: str) -> bool:
@@ -1009,6 +1058,25 @@ class Styles(StylesBase):
             )
             for rule_name, rule_value in self._rules.items()
         ]
+        # Declarations which reference variables that were not resolvable at
+        # parse time have no concrete rule value yet. Emit a sentinel so the
+        # stylesheet considers them during specificity selection and resolves
+        # them per node against the custom property cascade. Declarations
+        # which merely *may* be overridden later (deferred but concretely
+        # resolved at parse time) don't emit sentinels.
+        for rule_name in self.unresolved:
+            rules.append(
+                (
+                    rule_name,
+                    (
+                        default_rules,
+                        1 if is_important(rule_name) else 0,
+                        *specificity,
+                        tie_breaker,
+                    ),
+                    _UNRESOLVED_RULE,
+                )
+            )
 
         return rules
 

@@ -212,6 +212,12 @@ class DOMNode(MessagePump):
         # A mapping of class names to Styles set in COMPONENT_CLASSES
         self._component_styles: dict[str, RenderStyles] = {}
 
+        # Subtree scoped CSS custom properties, set via
+        # `set_custom_property` / `unset_custom_property`. Names are stored
+        # without a leading '$'; values are raw strings which may reference
+        # other `$` names.
+        self._custom_properties: dict[str, str] = {}
+
         self._auto_refresh: float | None = None
         self._auto_refresh_timer: Timer | None = None
         self._css_types = {cls.__name__ for cls in self._css_bases(self.__class__)}
@@ -1813,6 +1819,139 @@ class DOMNode(MessagePump):
             self.app.update_styles(self, animate=animate)
         except NoActiveAppError:
             pass
+
+    @staticmethod
+    def _normalize_custom_property_name(name: str) -> str:
+        """Normalize a custom property name, trimming a leading ``$``.
+
+        Args:
+            name: A name with or without a leading ``$``.
+
+        Raises:
+            ValueError: If the name is empty or contains invalid characters.
+
+        Returns:
+            The bare variable name.
+        """
+        if not isinstance(name, str) or not name:
+            raise ValueError("CSS custom property name must be a non-empty string")
+        if name.startswith("$"):
+            name = name[1:]
+        if not name or not all(
+            character.isalnum() or character in "_-" for character in name
+        ):
+            raise ValueError(f"Invalid CSS custom property name {name!r}")
+        return name
+
+    def get_custom_property(self, name: str) -> str | None:
+        """Get a custom property defined on this node.
+
+        Note:
+            This returns only properties set directly on this node, not
+            properties inherited from ancestors.
+
+        Args:
+            name: The property name, with or without a leading ``$``.
+
+        Returns:
+            The property value, or ``None`` if not set on this node.
+        """
+        return self._custom_properties.get(self._normalize_custom_property_name(name))
+
+    def set_custom_property(self, name: str, value: str) -> Self:
+        """Set a subtree scoped CSS custom property on this node.
+
+        The property is visible to this node and all its descendants when
+        ``$name`` references are resolved in TCSS. The value may itself
+        reference other ``$`` names, which are resolved against the same
+        cascade (theme / global variables plus ancestor custom properties,
+        nearest wins). A property set here overrides a same-named theme /
+        global variable as well as ancestor properties.
+
+        Setting or replacing a property immediately recomputes the styles
+        of this node and every descendant, including layout. The method is
+        safe to call from a worker thread; the mutation and style update are
+        marshalled onto the app's main thread.
+
+        Args:
+            name: The property name, with or without a leading ``$``.
+            value: The property value as a TCSS value string.
+
+        Returns:
+            Self.
+        """
+        property_name = self._normalize_custom_property_name(name)
+        value = str(value)
+
+        def _set() -> Self:
+            if self._custom_properties.get(property_name) != value:
+                self._custom_properties[property_name] = value
+                if self.is_mounted:
+                    self.update_node_styles(animate=False)
+            return self
+
+        try:
+            app = self.app
+        except NoActiveAppError:
+            app = None
+        if app is not None and app._thread_id != threading.get_ident():
+            return app.call_from_thread(_set)
+        return _set()
+
+    def unset_custom_property(self, name: str) -> Self:
+        """Remove a subtree scoped CSS custom property from this node.
+
+        After removal, this node and its descendants resolve the name from
+        the nearest ancestor defining it, falling back to the theme / global
+        variables. Styles and layout of the subtree are recomputed. Safe to
+        call from a worker thread.
+
+        Args:
+            name: The property name, with or without a leading ``$``.
+
+        Returns:
+            Self.
+        """
+        property_name = self._normalize_custom_property_name(name)
+
+        def _unset() -> Self:
+            if self._custom_properties.pop(property_name, None) is not None:
+                if self.is_mounted:
+                    self.update_node_styles(animate=False)
+            return self
+
+        try:
+            app = self.app
+        except NoActiveAppError:
+            app = None
+        if app is not None and app._thread_id != threading.get_ident():
+            return app.call_from_thread(_unset)
+        return _unset()
+
+    def _get_custom_property_cascade(
+        self,
+    ) -> tuple[dict[str, str], tuple[tuple[str, str], ...]]:
+        """Merge custom properties on this node with those of its ancestors.
+
+        Root nodes are merged first so properties defined nearer the node
+        override more distant ancestors.
+
+        Returns:
+            A tuple of the merged name/value mapping and an identity key.
+            The key is an empty tuple when no custom properties are visible.
+        """
+        chain: list[dict[str, str]] = []
+        node: MessagePump | None = self
+        while isinstance(node, DOMNode):
+            if node._custom_properties:
+                chain.append(node._custom_properties)
+            node = node._parent
+        if not chain:
+            return {}, ()
+        merged: dict[str, str] = {}
+        for properties in reversed(chain):
+            merged.update(properties)
+        return merged, tuple(sorted(merged.items()))
 
     def add_class(self, *class_names: str, update: bool = True) -> Self:
         """Add class names to this Node.

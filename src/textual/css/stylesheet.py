@@ -15,11 +15,16 @@ from rich.panel import Panel
 from rich.text import Text
 
 from textual.cache import LRUCache
-from textual.css.errors import StylesheetError
+from textual.css.errors import StylesheetError, UnresolvedVariableError
 from textual.css.match import _check_selectors
 from textual.css.model import RuleSet
-from textual.css.parse import parse
-from textual.css.styles import RulesMap, Styles
+from textual.css.parse import parse, substitute_references
+from textual.css.styles import (
+    DeferredDeclaration,
+    RulesMap,
+    Styles,
+    _UNRESOLVED_RULE,
+)
 from textual.css.tokenize import Token, tokenize_values
 from textual.css.tokenizer import TokenError
 from textual.css.types import CSSLocation, Specificity3, Specificity6
@@ -152,6 +157,19 @@ class Stylesheet:
         self._invalid_css: set[str] = set()
         self._parse_cache: LRUCache[tuple, list[RuleSet]] = LRUCache(64)
         self._style_parse_cache: LRUCache[str, Style] = LRUCache(1024 * 4)
+        # Bumped whenever the global / theme variables are replaced, so that
+        # caches keyed on a node's custom property cascade can be invalidated.
+        self._variables_version: int = 0
+        # Expanded variable tokens for a given custom property cascade:
+        # (cascade key, variables version) -> tokens
+        self._cascade_cache: LRUCache[tuple, dict[str, list[Token]]] = LRUCache(
+            256
+        )
+        # Resolved rule values for a deferred declaration under a cascade:
+        # (declaration, cascade key, variables version) -> produced rules
+        self._resolved_declaration_cache: LRUCache[tuple, RulesMap] = LRUCache(
+            4096
+        )
 
     def __rich_repr__(self) -> rich.repr.Result:
         yield list(self.source.keys())
@@ -217,8 +235,11 @@ class Stylesheet:
         self._variables = variables
         self.__variable_tokens = None
         self._invalid_css = set()
+        self._variables_version += 1
         self._parse_cache.clear()
         self._style_parse_cache.clear()
+        self._cascade_cache.clear()
+        self._resolved_declaration_cache.clear()
 
     def parse_style(self, style_text: str | Style) -> Style:
         """Parse a (visual) Style.
@@ -277,6 +298,22 @@ class Stylesheet:
                 )
             )
 
+        except UnresolvedVariableError:
+            # A variable which isn't defined globally / by the theme may be
+            # supplied at apply time by a node's subtree scoped custom
+            # properties. Re-parse keeping the references unresolved so the
+            # declarations can be resolved per node.
+            rules = list(
+                parse(
+                    scope,
+                    css,
+                    read_from,
+                    variable_tokens=self._variable_tokens,
+                    is_default_rules=is_default_rules,
+                    tie_breaker=tie_breaker,
+                    allow_unresolved=True,
+                )
+            )
         except TokenError:
             raise
         except Exception as error:
@@ -436,6 +473,8 @@ class Stylesheet:
             self._rules_map = None
             self.source = stylesheet.source
             self._require_parse = False
+            self._cascade_cache.clear()
+            self._resolved_declaration_cache.clear()
 
     @classmethod
     def _check_rule(
@@ -490,7 +529,9 @@ class Stylesheet:
         # We can use this to determine, for a given rule, whether we should apply it
         # or not by examining the specificity. If we have two rules for the
         # same attribute, then we can choose the most specific rule and use that.
-        rule_attributes: defaultdict[str, list[tuple[Specificity6, object]]]
+        rule_attributes: defaultdict[
+            str, list[tuple[Specificity6, object, DeferredDeclaration | None]]
+        ]
         rule_attributes = defaultdict(list)
 
         rules_map = self.rules_map
@@ -512,6 +553,16 @@ class Stylesheet:
             "odd" in all_pseudo_classes or "even" in all_pseudo_classes
         )
 
+        # If any of the rules which may match this node contain declarations
+        # referencing variables, gather the node's subtree scoped custom
+        # property cascade. Without it, the path below is identical to the
+        # no-custom-property behaviour.
+        deferred_possible = any(rule.styles.deferred for rule in rules)
+        cascade_variables: dict[str, str] = {}
+        cascade_key: tuple[tuple[str, str], ...] = ()
+        if deferred_possible:
+            cascade_variables, cascade_key = node._get_custom_property_cascade()
+
         cache_key: tuple | None = None
 
         if cache is not None and all_pseudo_classes.isdisjoint(
@@ -528,6 +579,10 @@ class Stylesheet:
                 node._pseudo_classes_cache_key,
                 node._css_type_name,
             )
+            # The custom property cascade visible to a node is part of the key,
+            # so resolved values never leak from one subtree into another.
+            if cascade_key:
+                cache_key = (*cache_key, cascade_key)
             cached_result: RulesMap | None = cache.get(cache_key)
             if cached_result is not None:
                 self.replace_rules(node, cached_result, animate=animate)
@@ -545,6 +600,7 @@ class Stylesheet:
         for rule in rules:
             is_default_rules = rule.is_default_rules
             tie_breaker = rule.tie_breaker
+            rule_deferred = rule.styles.deferred
             for base_specificity in _check_rule(rule, css_path_nodes):
                 for key, rule_specificity, value in rule.styles.extract_rules(
                     base_specificity, is_default_rules, tie_breaker
@@ -554,18 +610,19 @@ class Stylesheet:
                             initial_defaults.add(key)
                         else:
                             initial.add(key)
-                    rule_attributes[key].append((rule_specificity, value))
+                    rule_attributes[key].append(
+                        (rule_specificity, value, rule_deferred.get(key))
+                    )
 
         if rule_attributes:
             # For each rule declared for this node, keep only the most specific one
             get_first_item = itemgetter(0)
-            node_rules: RulesMap = cast(
-                RulesMap,
-                {
-                    name: max(specificity_rules, key=get_first_item)[1]
-                    for name, specificity_rules in rule_attributes.items()
-                },
-            )
+            node_rules: RulesMap = cast(RulesMap, {})
+            node_rule_deferred: dict[str, DeferredDeclaration | None] = {}
+            for name, specificity_rules in rule_attributes.items():
+                winner = max(specificity_rules, key=get_first_item)
+                node_rules[name] = winner[1]
+                node_rule_deferred[name] = winner[2]
 
             # Set initial values
             for initial_rule_name in initial:
@@ -601,10 +658,147 @@ class Stylesheet:
                         rule_value = getattr(_DEFAULT_STYLES, initial_rule_name)
                     node_rules[initial_rule_name] = rule_value  # type: ignore[literal-required]
 
+            if deferred_possible:
+                # Resolve deferred variable declarations against the node's
+                # cascade. A cascade present on the ancestor chain can
+                # override even declarations which were resolvable at parse
+                # time; sentinel values must always be resolved here.
+                needs_resolution = cascade_key or any(
+                    value is _UNRESOLVED_RULE for value in node_rules.values()
+                )
+                if needs_resolution:
+                    cascade_tokens = self._get_cascade_tokens(
+                        cascade_variables, cascade_key
+                    )
+                    deferred_groups: dict[
+                        DeferredDeclaration, list[str]
+                    ] = defaultdict(list)
+                    for key, deferred in node_rule_deferred.items():
+                        if deferred is None:
+                            continue
+                        deferred_groups[deferred].append(key)
+                    for deferred, keys in deferred_groups.items():
+                        produced = self._resolve_deferred_declaration(
+                            deferred, cascade_tokens, cascade_key
+                        )
+                        for key in keys:
+                            if key in produced:
+                                node_rules[key] = produced[key]
+                            else:
+                                # The declaration didn't write this rule name
+                                # with the resolved value (e.g. `color: auto`).
+                                node_rules.pop(key, None)
+                    if any(
+                        value is _UNRESOLVED_RULE
+                        for value in node_rules.values()
+                    ):
+                        # Strict resolution should have raised for missing
+                        # variables; guard against a sentinel ever leaking.
+                        raise StylesheetError(
+                            "Unable to resolve CSS variable in stylesheet"
+                        )
+
             if cache_key is not None:
                 cache[cache_key] = node_rules
             self.replace_rules(node, node_rules, animate=animate)
         self._process_component_classes(node)
+
+    def _get_cascade_tokens(
+        self,
+        cascade_variables: dict[str, str],
+        cascade_key: tuple[tuple[str, str], ...],
+    ) -> dict[str, list[Token]]:
+        """Build the tokenized, fully expanded variable environment for a cascade.
+
+        Global / theme variables form the base, overridden by the node's
+        ancestor custom properties (nearest wins). Values which themselves
+        reference other ``$`` names are expanded until stable so references
+        are resolved transitively.
+
+        Args:
+            cascade_variables: Merged custom properties visible to a node.
+            cascade_key: Identity tuple of the merged custom properties.
+
+        Returns:
+            Mapping of variable name to expanded value tokens.
+        """
+        cache_key = (cascade_key, self._variables_version)
+        cached = self._cascade_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        merged = {**self._variables, **cascade_variables}
+        expanded: dict[str, list[Token]] = {
+            name: list(tokens) for name, tokens in tokenize_values(merged).items()
+        }
+        # Values may reference one another (`$b: $a; $c: $b`). Substitute
+        # repeatedly until a fixed point is reached.
+        for _ in range(len(expanded) + 1):
+            changed = False
+            for name, tokens in expanded.items():
+                if not any(token.name == "variable_ref" for token in tokens):
+                    continue
+                new_tokens = list(
+                    substitute_references(
+                        iter(tokens), expanded, allow_unresolved=True
+                    )
+                )
+                if new_tokens != tokens:
+                    expanded[name] = new_tokens
+                    changed = True
+            if not changed:
+                break
+        self._cascade_cache[cache_key] = expanded
+        return expanded
+
+    def _resolve_deferred_declaration(
+        self,
+        deferred: DeferredDeclaration,
+        cascade_tokens: dict[str, list[Token]],
+        cascade_key: tuple[tuple[str, str], ...],
+    ) -> RulesMap:
+        """Resolve a deferred declaration's raw value for one node cascade.
+
+        Args:
+            deferred: The deferred declaration recorded at parse time.
+            cascade_tokens: The fully expanded variable environment.
+            cascade_key: Identity tuple of the merged custom properties.
+
+        Raises:
+            UnresolvedVariableError: If the value references a variable
+                defined by neither the global / theme variables nor the
+                subtree custom property cascade.
+
+        Returns:
+            A mapping of produced rule names to concrete values.
+        """
+        cache_key = (
+            deferred.css_name,
+            deferred.raw_value,
+            deferred.read_from,
+            cascade_key,
+            self._variables_version,
+        )
+        cached = self._resolved_declaration_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        css = f"*{{{deferred.css_name}:{deferred.raw_value}}}"
+        rule_sets = list(
+            parse(
+                "",
+                css,
+                deferred.read_from,
+                variable_tokens=cascade_tokens,
+            )
+        )
+        if rule_sets and rule_sets[0].errors:
+            # The resolved value is otherwise invalid (bad type, etc.):
+            # surface it rather than silently dropping the declaration.
+            raise StylesheetError(str(rule_sets[0].errors[0].message))
+        produced: RulesMap = (
+            rule_sets[0].styles.get_rules() if rule_sets else {}
+        )
+        self._resolved_declaration_cache[cache_key] = produced
+        return produced
 
     def _process_component_classes(self, node: DOMNode) -> None:
         """Process component classes for the given node.
